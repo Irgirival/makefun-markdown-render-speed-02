@@ -1246,7 +1246,492 @@ function renderInlineList(list, out) {
 }
 
 // Full inline render of a source string (paragraph / heading / table cell).
+// ---------------------------------------------------------------------------
+// Inline engine v2 — direct-render port of marked 18.1.3's inline pipeline
+// (Lexer.inlineTokens + Tokenizer + Renderer + TextRenderer, GFM rules).
+// Replaces the phase-1/phase-2 engine (scanInline/processEmphasis/
+// renderInlineList, kept below as inlineToHtmlOld for fallback). The port
+// renders HTML directly while tokenizing (no token tree), which keeps it
+// faster than marked's build-then-render pass. Regexes below are copied
+// verbatim from marked 18.1.3's inline.gfm rules (vendored oracle).
+// ---------------------------------------------------------------------------
+
+// marked's inline.gfm regexes (verbatim).
+const IX_ESCAPE = /^\\([!"#$%&'()*+,\-.\/:;<=>?@\[\]\\^_`{|}~])/;
+const IX_CODE = /^(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/;
+const IX_BR = /^( {2,}|\\)\n(?!\s*$)[ \t]*/;
+const IX_TEXT = /^(?:[^a-zA-Z0-9](?=(?:mailto|xmpp):)|(`+|~+|[^`~])(?:(?=[`~])|(?= {2,}\n)|(?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@)|[\s\S]*?(?:(?=[\\<!\[`*~_]|\b_|[hH][tT][tT][pP][sS]?|[fF][tT][pP]:\/\/|(?<![^\s*_~(])www\.|$)|[^ ](?= {2,}\n)|[^a-zA-Z0-9](?=(?:mailto|xmpp):)|[^a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-](?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@))))/;
+const IX_PUNCT = /^((?![*_])[\s\p{P}\p{S}])/u;
+const IX_BLOCKSKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+const IX_AUTOLINK = /^<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^\s\x00-\x1f<>]*|[a-zA-Z0-9.!#$%&'*+\/=?_`{|}~-]+(@)[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![-_]))>/;
+const IX_TAG = /^<!--(?:-?>|[\s\S]*?-->)|^<\/[a-zA-Z][a-zA-Z0-9-]*\s*>|^<[a-zA-Z][a-zA-Z0-9-]*(?:\s+[a-zA-Z:_][\w.:-]*(?:\s*=\s*"[^"]*"|\s*=\s*'[^']*'|\s*=\s*[^\s"'=<>`]+)?)*?\s*\/?>|^<\?[\s\S]*?\?>|^<![a-zA-Z]+\s[\s\S]*?>|^<!\[CDATA\[[\s\S]*?\]\]>/;
+const IX_LINK = /^!?\[((?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\])|[^\[\]\\`])*?)\]\([ \t\n]*(<(?:\\.|[^\n<>\\])+>|[^ \t\n\x00-\x1f]+|(?=\)))(?:(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^)\\])*\)))?[ \t\n]*\)/;
+const IX_REFLINK = /^!?\[((?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\])|[^\[\]\\`])*?)\]\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n))+)\]/;
+const IX_NOLINK = /^!?\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\\n]|\n(?![ \t]*\n))+)\](?:\[\])?/;
+const IX_REFLINKSEARCH = /!?\[((?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?)\]\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\]|!?\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999})\](?:\[\])?(?!\()/g;
+const IX_URL = /^(?:mailto:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])|xmpp:[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])(?:\/[A-Za-z0-9@.]+)?)|^((?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/|www\.)(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*|^[A-Za-z0-9._+-]+(@)[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
+const IX_BACKPEDAL = /(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/;
+const IX_DEL_LDELIM = /^~~?(?:((?!~)[\p{P}\p{S}])|[^\s~])/u;
+const IX_DEL_RDELIM = /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
+const IX_EM_LDELIM = /^(?:\*+(?:((?!\*)(?!~)[\p{P}\p{S}])|([^\s*]))?)|^_+(?:((?!_)(?!~)[\p{P}\p{S}])|([^\s_]))?/u;
+const IX_EM_RDELIM_AST = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
+const IX_EM_RDELIM_UND = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)|[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
+const IX_ANY_PUNCT = /\\([\p{P}\p{S}])/gu;
+const IX_ANY_PUNCT_OUTSIDE_CODE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const IX_OUTPUT_LINK_REPLACE = /\\([\[\]])/g;
+const IX_UNICODE_ALNUM = /[\p{L}\p{N}]/u;
+const IX_START_A = /^<a /i;
+const IX_END_A = /^<\/a>/i;
+const IX_START_PRE = /^<(pre|code|kbd|script)(\s|>)/i;
+const IX_END_PRE = /^<\/(pre|code|kbd|script)(\s|>)/i;
+const IX_START_ANGLE = /^</;
+const IX_END_ANGLE = />$/;
+const IX_NUM_REF_TEST = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
+const IX_NUM_REF_OR_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
+const IX_NEWLINE = /\n/g;
+const IX_NON_SPACE = /[^ ]/;
+
+// marked's P (escape): encode=true escapes &<>"'; encode=false escapes
+// <>"' and a bare & not starting a valid reference.
+const IX_ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const IX_ESC_TEST = /[&<>"']/;
+const IX_ESC_REPLACE = /[&<>"']/g;
+const IX_ESC_NOENC_TEST = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
+const IX_ESC_NOENC_REPLACE = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
+function ixP(a, encode) {
+  if (encode) {
+    if (IX_ESC_TEST.test(a)) return a.replace(IX_ESC_REPLACE, c => IX_ESC_MAP[c]);
+  } else if (IX_ESC_NOENC_TEST.test(a)) {
+    return a.replace(IX_ESC_NOENC_REPLACE, c => IX_ESC_MAP[c]);
+  }
+  return a;
+}
+
+// marked's Ie: decode numeric character references only (named entities
+// stay verbatim); a bare & not starting a valid reference becomes &amp;.
+function ieDecode(a) {
+  if (!IX_NUM_REF_TEST.test(a)) return a;
+  return a.replace(IX_NUM_REF_OR_AMP, (e, t, n) => {
+    if (t === void 0 && n === void 0) return '&amp;';
+    const s = t === void 0 ? Number.parseInt(n, 16) : Number.parseInt(t, 10);
+    return s === 0 || s > 1114111 || (s >= 55296 && s <= 57343) ? '\uFFFD' :
+      s === 38 ? '&amp;' : String.fromCodePoint(s);
+  });
+}
+
+// Per-parse inline state (marked's Lexer.state). inLinkState is the shared
+// module flag (persists across blocks, like marked); the rest reset per
+// parse() call, and ixInRawBlock resets at the start of each top-level
+// inlineToHtml call (marked resets it per inlineQueue entry).
+let ixRefs = null;
+let ixInRawBlock = false;
+let ixLinkEmitted = false;
+let ixLinkParenPossible = true;
+
+// marked's fe: last possible closer indices for a mask (run starts whose
+// preceding char is not whitespace).
+function ixFe(a) {
+  const e = { '*': -1, '_': -1 };
+  let t = -1;
+  const n = a.length;
+  for (let s = 0; s < n; s++) {
+    const r = a[s];
+    if (r !== '*' && r !== '_' && r !== '~') continue;
+    const o = s === 0 ? '\n' : a[s - 1];
+    let i = s + 1;
+    for (; i < n && a[i] === r; ) i++;
+    if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') {
+      if (r === '~') t = s; else e[r] = s;
+    }
+    s = i - 1;
+  }
+  return { maskedSrc: a, lastPossibleEmStrongCloserIndex: e, lastPossibleDelCloserIndex: t };
+}
+
+// marked's linkInText: does `e` contain a (non-image) link to a defined ref
+// whose label does not itself contain a link? The first loop catches INLINE
+// links: a blockSkip match that the link regex accepts, not preceded by '!'.
+function ixLinkInText(e) {
+  if (!e.includes('[')) return false;
+  for (const n of e.matchAll(IX_BLOCKSKIP)) {
+    if (IX_LINK.test(n[0]) && e.charAt(n.index - 1) !== '!') return true;
+  }
+  for (const n of e.matchAll(IX_REFLINKSEARCH)) {
+    const s = n[0], r = s.lastIndexOf('[');
+    if (!(s.charAt(0) === '!' || !ixRefs.has(normalizeLabel(s.slice(r + 1, -1)))) &&
+        !(r > 1 && ixLinkInText(s.slice(1, r - 1)))) return true;
+  }
+  return false;
+}
+
+// marked's #n: the emStrong mask. Length-preserving: reflink matches and
+// blockSkip matches (links/code/html) become [aaa...], escaped punctuation
+// becomes +, backticks inside code spans become +.
+function ixMask(src) {
+  let t = src;
+  if (ixRefs && ixRefs.size > 0 && src.includes('[')) {
+    const n = IX_REFLINKSEARCH;
+    const s = r => {
+      const o = r.lastIndexOf('[');
+      if (!ixRefs.has(normalizeLabel(r.slice(o + 1, -1)))) return r;
+      if (o > 1 && r.charAt(0) !== '!') {
+        const i = r.slice(1, o - 1);
+        if (ixLinkInText(i)) return '[' + i.replace(n, s) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+      }
+      return '[' + 'a'.repeat(r.length - 2) + ']';
+    };
+    t = t.replace(n, s);
+  }
+  t = t.replace(IX_ANY_PUNCT_OUTSIDE_CODE, (n, s, r) =>
+    r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  t = t.replace(IX_BLOCKSKIP, (n, s, r) => {
+    const o = r ? r.length : 0;
+    return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']';
+  });
+  return t;
+}
+
+// marked's L (strip trailing backslashes; the `t` argument is never passed).
+function ixStripTrailingBs(a) {
+  const n = a.length;
+  let s = 0;
+  for (; s < n; ) {
+    const r = a.charAt(n - s - 1);
+    if (r === '\\') s++;
+    else break;
+  }
+  return a.slice(0, n - s);
+}
+
+// marked's ke: paren balance of a bare destination. -1 = no parens,
+// -2 = unclosed '(', otherwise the index of the ')' closing the outermost '('.
+function ixKe(a) {
+  if (a.indexOf('(') === -1 && a.indexOf(')') === -1) return -1;
+  let t = 0;
+  for (let n = 0; n < a.length; n++) {
+    if (a[n] === '\\') n++;
+    else if (a[n] === '(') t++;
+    else if (a[n] === ')' && (t--, t < 0)) return n;
+  }
+  return t > 0 ? -2 : -1;
+}
+
+// marked's Be: does the link label contain a <tag/autolink that extends
+// past the label end? `a` is the remaining source, `e` the label text,
+// `t` the index of the label's first char in `a`.
+function ixBe(a, e, t) {
+  if (!e.includes('<')) return false;
+  for (let s = 0; s < e.length; s++) {
+    if (e[s] === '\\') { s++; continue; }
+    if (e[s] === '`') {
+      const i = IX_CODE.exec(e.slice(s));
+      if (i) { s += i[0].length - 1; continue; }
+    }
+    if (e[s] !== '<') continue;
+    const r = a.slice(t + s);
+    const o = IX_TAG.exec(r) || IX_AUTOLINK.exec(r);
+    if (o) {
+      if (o[0].length > e.length - s) return true;
+      s += o[0].length - 1;
+    }
+  }
+  return false;
+}
+
+// marked's De (link formation) + Renderer.link/image, direct-rendered.
+// Renders the label with ixInlineHtml: plain text for images (the alt is
+// always text-rendered), otherwise in the current mode (a link inside an
+// image alt renders its label as plain text). Returns the HTML string, or
+// null when the link is rejected (label contains a link).
+function ixDe(match, href, title, isImage, textOnly) {
+  const labelText = match[1].replace(IX_OUTPUT_LINK_REPLACE, '$1');
+  const savedInLink = inLinkState, savedLinkEmitted = ixLinkEmitted, savedInRawBlock = ixInRawBlock;
+  inLinkState = true;
+  ixLinkEmitted = false;
+  const labelHtml = ixInlineHtml(labelText, isImage ? true : textOnly);
+  const k = ixLinkEmitted;
+  ixLinkEmitted = savedLinkEmitted;
+  inLinkState = savedInLink;
+  if (!isImage) {
+    if (k) { ixInRawBlock = savedInRawBlock; return null; }
+    ixLinkEmitted = true;
+  }
+  if (textOnly) return labelHtml;
+  if (isImage) {
+    let out = '<img src="' + ixP(cleanUrl(href), false) + '" alt="' + ixP(labelHtml, false) + '"';
+    if (title) out += ' title="' + ixP(title, false) + '"';
+    return out + '>';
+  }
+  let out = '<a href="' + ixP(cleanUrl(href), false) + '"';
+  if (title) out += ' title="' + ixP(title, false) + '"';
+  return out + '>' + labelHtml + '</a>';
+}
+
+// Tokenizers. Each returns {raw, html} (and isText for inlineText), or null.
+// The first-char dispatch in ixInlineHtml preserves marked's #t order: each
+// regex is anchored and can only match a string starting with its own
+// first char, so tokenizers that cannot match are skipped entirely.
+
+function ixEscape(e, textOnly) {
+  const t = IX_ESCAPE.exec(e);
+  if (!t) return null;
+  return { raw: t[0], html: textOnly ? t[1] : ixP(t[1], false) };
+}
+
+function ixTag(e) {
+  const t = IX_TAG.exec(e);
+  if (!t) return null;
+  if (!inLinkState && IX_START_A.test(t[0])) inLinkState = true;
+  else if (inLinkState && IX_END_A.test(t[0])) inLinkState = false;
+  if (!ixInRawBlock && IX_START_PRE.test(t[0])) ixInRawBlock = true;
+  else if (ixInRawBlock && IX_END_PRE.test(t[0])) ixInRawBlock = false;
+  return { raw: t[0], html: t[0] };
+}
+
+function ixLink(e, textOnly) {
+  if (ixLinkParenPossible === false) return null;
+  const t = IX_LINK.exec(e);
+  if (!t) return null;
+  const n = t[0].charAt(0) === '!' ? 2 : 1;
+  if (ixBe(e, t[1], n)) return null;
+  const s = t[2].trim();
+  if (IX_START_ANGLE.test(s)) {
+    if (!IX_END_ANGLE.test(s)) return null;
+    const l = ixStripTrailingBs(s.slice(0, -1));
+    if ((s.length - l.length) % 2 === 0) return null;
+  } else {
+    const l = ixKe(t[2]);
+    if (l === -2) return null;
+    if (l > -1) {
+      const h = (t[0].indexOf('!') === 0 ? 5 : 4) + t[1].length + l;
+      t[2] = t[2].substring(0, l);
+      t[0] = t[0].substring(0, h).trim();
+      t[3] = '';
+    }
+  }
+  const r = ixStripTrailingBs(t[0].slice(0, -1));
+  if ((t[0].length - r.length) % 2 === 0) return null;
+  let o = t[2];
+  let i = t[3] ? t[3].slice(1, -1) : '';
+  o = o.trim();
+  if (IX_START_ANGLE.test(o)) o = o.slice(1, -1);
+  const html = ixDe(t, o && o.replace(IX_ANY_PUNCT, '$1'), i && i.replace(IX_ANY_PUNCT, '$1'), t[0].charAt(0) === '!', textOnly);
+  if (html === null) return null;
+  return { raw: t[0], html };
+}
+
+function ixReflink(e, textOnly) {
+  let n = IX_REFLINK.exec(e) || IX_NOLINK.exec(e);
+  if (!n) return null;
+  const s = n[0].charAt(0) === '!' ? 2 : 1;
+  if (ixBe(e, n[1], s)) return null;
+  const r = ixRefs.get(normalizeLabel(n[2] || n[1]));
+  if (!r) {
+    // marked returns a bare text token of just the first char ('!' or '[');
+    // it does not count as a text token for the emStrong prev-char rule.
+    const o = n[0].charAt(0);
+    return { raw: o, html: o };
+  }
+  const html = ixDe(n, r.href, r.title, n[0].charAt(0) === '!', textOnly);
+  if (html === null) return null;
+  return { raw: n[0], html };
+}
+
+function ixAutolink(e, textOnly) {
+  const t = IX_AUTOLINK.exec(e);
+  if (!t) return null;
+  let n, s;
+  if (t[2] === '@') { n = t[1]; s = 'mailto:' + n; }
+  else { n = t[1]; s = n; }
+  if (textOnly) return { raw: t[0], html: n };
+  return { raw: t[0], html: '<a href="' + ixP(cleanUrl(s), true) + '">' + ixP(n, true) + '</a>' };
+}
+
+function ixUrl(e, textOnly) {
+  const t = IX_URL.exec(e);
+  if (!t) return null;
+  let n, s;
+  if (t[2] === '@') { n = t[0]; s = 'mailto:' + n; }
+  else {
+    let r;
+    do {
+      r = t[0];
+      t[0] = IX_BACKPEDAL.exec(t[0])?.[0] ?? '';
+    } while (r !== t[0]);
+    n = t[0];
+    s = t[1] === 'www.' ? 'http://' + t[0] : t[0];
+  }
+  if (!n) return null;
+  if (textOnly) return { raw: t[0], html: n };
+  return { raw: t[0], html: '<a href="' + ixP(cleanUrl(s), true) + '">' + ixP(n, true) + '</a>' };
+}
+
+function ixCodespan(e, textOnly) {
+  const t = IX_CODE.exec(e);
+  if (!t) return null;
+  let n = t[2].replace(IX_NEWLINE, ' ');
+  if (IX_NON_SPACE.test(n) && n.charCodeAt(0) === 32 && n.charCodeAt(n.length - 1) === 32) {
+    n = n.substring(1, n.length - 1);
+  }
+  return { raw: t[0], html: textOnly ? n : '<code>' + ixP(n, true) + '</code>' };
+}
+
+function ixBr(e, textOnly) {
+  const t = IX_BR.exec(e);
+  if (!t) return null;
+  return { raw: t[0], html: textOnly ? '' : '<br>' };
+}
+
+function ixInlineText(e, textOnly) {
+  const t = IX_TEXT.exec(e);
+  if (!t) return null;
+  const raw = t[0];
+  let html;
+  if (textOnly) html = ixInRawBlock ? raw : ieDecode(raw);
+  else html = ixInRawBlock ? raw : ixP(ieDecode(raw), false);
+  return { raw, html, isText: true };
+}
+
+// marked's Tokenizer.emStrong, direct-rendered. `e` is the remaining
+// source, `mask` the full emStrong mask, `n` the previous char ('' unless
+// the immediately preceding token was text), `feResult` the fe() result
+// for the mask.
+function ixEmStrong(e, mask, n, feResult, textOnly) {
+  let s = IX_EM_LDELIM.exec(e);
+  if (!s || (!s[1] && !s[2] && !s[3] && !s[4])) return null;
+  const r = s[0][0];
+  const o = n === r;
+  const i = mask.length - e.length;
+  let l = i;
+  for (; l > 0 && mask[l - 1] === r; ) l--;
+  const p = [...mask.slice(Math.max(0, l - 2), l)].at(-1) ?? '';
+  const h = p === '*' || p === '_' || !!IX_PUNCT.exec(p);
+  if (l < i) n = p;
+  const u = l < i ? h : !!IX_PUNCT.exec(n);
+  if (s[4] && n.match(IX_UNICODE_ALNUM)) return null;
+  const d = s[1] || s[3] || '';
+  if (!d || !n || u) {
+    const k = [...s[0]].length - 1;
+    let g, b, m = k, f = 0;
+    const y = i - l + k;
+    const R = !!p.trim() && (!!d || (r === '*' && !h));
+    if (r !== '*' && r !== '_') return null;
+    const A = r === '*' ? IX_EM_RDELIM_AST : IX_EM_RDELIM_UND;
+    const v = feResult.lastPossibleEmStrongCloserIndex[r];
+    const Q = mask.length - e.length + k;
+    if (v < Q) return null;
+    const mm = mask.slice(-1 * e.length + k);
+    const ee = v - Q;
+    for (A.lastIndex = 0; (s = A.exec(mm)) !== null && !(s.index > ee); ) {
+      if (g = s[1] || s[2] || s[3] || s[4] || s[5] || s[6], !g) continue;
+      if (b = [...g].length, s[3] || s[4]) { m += b; continue; }
+      else if (s[5] || s[6] || R) {
+        if (o && (s[5] || s[6])) break;
+        if (y % 3 && !((y + b) % 3)) { f += b; continue; }
+      }
+      if (m -= b, m > 0) continue;
+      b = Math.min(b, b + m + f);
+      const te = [...s[0]][0].length;
+      const M = e.slice(0, k + s.index + te + b);
+      if (Math.min(k, b) % 2) {
+        const U = M.slice(1, -1);
+        return { raw: M, html: textOnly ? ixInlineHtml(U, true) : '<em>' + ixInlineHtml(U, textOnly) + '</em>' };
+      }
+      const ne = M.slice(2, -2);
+      return { raw: M, html: textOnly ? ixInlineHtml(ne, true) : '<strong>' + ixInlineHtml(ne, textOnly) + '</strong>' };
+    }
+  }
+  return null;
+}
+
+// marked's Tokenizer.del, direct-rendered.
+function ixDel(e, mask, n, feResult, textOnly) {
+  let s = IX_DEL_LDELIM.exec(e);
+  if (!s) return null;
+  if (!(s[1] || '') || !n || IX_PUNCT.exec(n)) {
+    const o = [...s[0]].length - 1;
+    let i, l, p = o;
+    const h = IX_DEL_RDELIM;
+    const u = feResult.lastPossibleDelCloserIndex;
+    const d = mask.length - e.length + o;
+    if (u < d) return null;
+    const mm = mask.slice(-1 * e.length + o);
+    const k = u - d;
+    for (h.lastIndex = 0; (s = h.exec(mm)) !== null && !(s.index > k); ) {
+      if (i = s[1] || s[2] || s[3] || s[4] || s[5] || s[6], !i || (l = [...i].length, l !== o)) continue;
+      if (s[3] || s[4]) { p += l; continue; }
+      if (p -= l, p > 0) continue;
+      l = Math.min(l, l + p);
+      const g = [...s[0]][0].length;
+      const b = e.slice(0, o + s.index + g + l);
+      const m = b.slice(o, -o);
+      return { raw: b, html: textOnly ? ixInlineHtml(m, true) : '<del>' + ixInlineHtml(m, textOnly) + '</del>' };
+    }
+  }
+  return null;
+}
+
+// marked's Lexer.#e + #t (inlineTokens), direct-rendered. The mask and the
+// fe() result are computed once per call (only when the text contains
+// *, _ or ~). Tokenizers are dispatched on the first character: every
+// tokenizer's regex is anchored and can only match a string starting with
+// its own first char, so the dispatch preserves #t's order exactly while
+// skipping the regexes that cannot match.
+function ixInlineHtml(src, textOnly) {
+  if (!src) return '';
+  const hasDelim = src.includes('*') || src.includes('_') || src.includes('~');
+  const mask = hasDelim ? ixMask(src) : src;
+  const feResult = hasDelim ? ixFe(mask) : null;
+  const savedLPP = ixLinkParenPossible;
+  ixLinkParenPossible = savedLPP && src.includes(')');
+  let out = '';
+  let e = src;
+  let prevText = false, prevLast = '';
+  let guard = Infinity;
+  while (e) {
+    if (e.length < guard) guard = e.length;
+    else throw new Error('Infinite loop on byte: ' + e.charCodeAt(0));
+    if (!prevText) prevLast = '';
+    prevText = false;
+    let tok = null;
+    const c0 = e.charCodeAt(0);
+    if (c0 === 92) { // backslash: escape, backslash hard break, or text
+      tok = ixEscape(e, textOnly) || ixBr(e, textOnly) || ixInlineText(e, textOnly);
+    } else if (c0 === 60) { // <: tag, autolink, or text
+      tok = ixTag(e) || ixAutolink(e, textOnly) || ixInlineText(e, textOnly);
+    } else if (c0 === 91 || c0 === 33) { // [ or !: link, reflink, or text
+      tok = ixLink(e, textOnly) || ixReflink(e, textOnly) || ixInlineText(e, textOnly);
+    } else if (c0 === 42 || c0 === 95) { // * or _: emStrong or text
+      tok = ixEmStrong(e, mask, prevLast, feResult, textOnly) || ixInlineText(e, textOnly);
+    } else if (c0 === 96) { // `: codespan or text
+      tok = ixCodespan(e, textOnly) || ixInlineText(e, textOnly);
+    } else if (c0 === 126) { // ~: del or text
+      tok = ixDel(e, mask, prevLast, feResult, textOnly) || ixInlineText(e, textOnly);
+    } else if (c0 === 32) { // space: br (two spaces + newline) or text
+      tok = ixBr(e, textOnly) || ixInlineText(e, textOnly);
+    } else { // anything else: bare URL/email (unless inside a link), or text
+      tok = (!inLinkState && ixUrl(e, textOnly)) || ixInlineText(e, textOnly);
+    }
+    if (!tok) throw new Error('Infinite loop on byte: ' + e.charCodeAt(0));
+    out += tok.html;
+    e = e.slice(tok.raw.length);
+    if (tok.isText) {
+      if (tok.raw.charCodeAt(tok.raw.length - 1) !== 95) prevLast = tok.raw.slice(-1);
+      prevText = true;
+    }
+  }
+  ixLinkParenPossible = savedLPP;
+  return out;
+}
+
 function inlineToHtml(src, refs) {
+  if (!src) return '';
+  ixRefs = refs;
+  ixInRawBlock = false;
+  return ixInlineHtml(src, false);
+}
+
+function inlineToHtmlOld(src, refs) {
   if (!src) return '';
   const { head, delims } = scanInline(src, refs);
   if (!head) return '';
@@ -2101,7 +2586,10 @@ function parseBlocks(lines, start, end, refs, tight, endsWithNL, collect, lazySe
             }
           }
         }
-        content.push(stripFenceIndent(l, fence.indentChars));
+        // marked's Dt (indentCodeCompensation) only strips the fence indent
+        // for backtick fences: /^(\s+)(?:```)/ never matches a ~~~ fence,
+        // so a tilde fence's content keeps its indentation (doc-22/29).
+        content.push(fence.ch === '`' ? stripFenceIndent(l, fence.indentChars) : l);
         j++;
       }
       const info = fence.info.trim();
@@ -2321,6 +2809,10 @@ let inLinkState = false;
 
 export function parse(markdown) {
   inLinkState = false;
+  ixRefs = null;
+  ixInRawBlock = false;
+  ixLinkEmitted = false;
+  ixLinkParenPossible = true;
   const src = String(markdown).replace(/\r\n?/g, '\n');
   const refs = new Map();
   const endsWithNL = src.endsWith('\n');
